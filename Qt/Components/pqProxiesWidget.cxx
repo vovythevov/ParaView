@@ -198,6 +198,7 @@ void pqProxiesWidget::triggerRestartRequired()
 //-----------------------------------------------------------------------------
 bool pqProxiesWidget::filterWidgets(bool show_advanced, const QString& filterText)
 {
+  bool retval = false;
   // forward to internal pqProxyWidget instances.
   pqInternals& internals = *this->Internals;
   for (pqInternals::MapOfProxyList::const_iterator iter = internals.ComponentProxies.constBegin();
@@ -206,9 +207,11 @@ bool pqProxiesWidget::filterWidgets(bool show_advanced, const QString& filterTex
     {
     foreach (const pqInternals::ProxyInfo& info, iter.value())
       {
-      info.ProxyWidget->filterWidgets(show_advanced, filterText);
+      bool val = info.ProxyWidget->filterWidgets(show_advanced, filterText);
+      retval |= val;
       }
     }
+  return retval;
 }
 
 //-----------------------------------------------------------------------------
