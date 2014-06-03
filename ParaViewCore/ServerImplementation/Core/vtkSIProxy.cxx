@@ -28,6 +28,7 @@
 #include "vtkSMMessage.h"
 
 #include <map>
+#include <queue>
 #include <set>
 #include <string>
 #include <vtksys/ios/sstream>
@@ -55,9 +56,22 @@ public:
     this->SubSIProxies.clear();
     }
 
+  // Map from name to properties
   typedef std::map<std::string, vtkSmartPointer<vtkSIProperty> >
     SIPropertiesMapType;
   SIPropertiesMapType SIProperties;
+
+  struct ExposedSIPropertyInfo
+    {
+    vtkStdString SubProxyName;
+    vtkStdString PropertyName;
+    };
+
+  // Map for exposed properties. The key is the exposed property name,
+  // value is a ExposedPropertyInfo object which indicates the subproxy name
+  // and the property name in that subproxy.
+  typedef std::map<vtkStdString, ExposedSIPropertyInfo> ExposedSIPropertyInfoMap;
+  ExposedSIPropertyInfoMap ExposedSIProperties;
 
   typedef std::map<std::string, vtkSmartPointer<vtkSIProxy> >
     SubSIProxiesMapType;
@@ -234,7 +248,7 @@ vtkSIProxyDefinitionManager* vtkSIProxy::GetProxyDefinitionManager()
 }
 
 //----------------------------------------------------------------------------
-vtkSIProperty* vtkSIProxy::GetSIProperty(const char* name)
+vtkSIProperty* vtkSIProxy::GetSIProperty(const char* name, int selfOnly)
 {
   vtkInternals::SIPropertiesMapType::iterator iter =
     this->Internals->SIProperties.find(name);
@@ -242,7 +256,67 @@ vtkSIProperty* vtkSIProxy::GetSIProperty(const char* name)
     {
     return iter->second.GetPointer();
     }
+  if (!selfOnly)
+    {
+    vtkSIProxy::vtkInternals::ExposedSIPropertyInfoMap::iterator eiter =
+      this->Internals->ExposedSIProperties.find(name);
+    if (eiter == this->Internals->ExposedSIProperties.end())
+      {
+      // no such property is being exposed.
+      return 0;
+      }
+    const char* subproxy_name =  eiter->second.SubProxyName.c_str();
+    const char* property_name = eiter->second.PropertyName.c_str();
+    vtkSIProxy * si = this->GetSubSIProxy(subproxy_name);
+    if (si)
+      {
+      return si->GetSIProperty(property_name);
+      }
+    // indicates that the internal dbase for exposed properties is
+    // corrupt.. when a subproxy was removed, the exposed properties
+    // for that proxy should also have been cleaned up.
+    // Flag an error so that it can be debugged.
+    vtkWarningMacro("Subproxy required for the exposed property is missing."
+                    "No subproxy with name : " << subproxy_name);
+    }
+
   return NULL;
+}
+
+//----------------------------------------------------------------------------
+vtkSIProxy* vtkSIProxy::GetTrueSIProxy(const char* name)
+{
+  vtkSIProxy* trueProxy = NULL;
+
+  vtkSIProperty* prop = this->GetSIProperty(name);
+  if (!prop)
+    {
+    return NULL;
+    }
+
+  // Recurse on the subproxies to find which one is the true owner of
+  // the named property.
+  std::queue<vtkSIProxy*> candidateProxies;
+  candidateProxies.push(this);
+  while (!candidateProxies.empty())
+    {
+    vtkSIProxy* candidateProxy = candidateProxies.front();
+    candidateProxies.pop();
+    if (candidateProxy->GetSIProperty(prop->GetXMLName(), 1) == prop)
+      {
+      trueProxy = candidateProxy;
+      break;
+      }
+    else
+      {
+      for (unsigned int i = 0; i < candidateProxy->GetNumberOfSubSIProxys(); ++i)
+        {
+        candidateProxies.push(candidateProxy->GetSubSIProxy(i));
+        }
+      }
+    }
+
+  return trueProxy;
 }
 
 //----------------------------------------------------------------------------
@@ -440,9 +514,62 @@ bool vtkSIProxy::ReadXMLAttributes(vtkPVXMLElement* element)
 }
 
 //----------------------------------------------------------------------------
-bool vtkSIProxy::ReadXMLSubProxy(vtkPVXMLElement* )
+bool vtkSIProxy::ReadXMLSubProxy(vtkPVXMLElement* element)
 {
-  // vtkErrorMacro("Not supported yet.");
+  vtkPVXMLElement* proxyElement = element->FindNestedElementByName("Proxy");
+  if (!proxyElement)
+    {
+    return true;
+    }
+
+  const char* subproxy_name = proxyElement->GetAttribute("name");
+  if (!subproxy_name)
+    {
+    vtkErrorMacro(<< "Name not specified. Subproxy cannot be initialized.");
+    return false;
+    }
+
+  vtkSIProxy* subProxy = this->GetSubSIProxy(subproxy_name);
+  if (!subProxy)
+    {
+    // FIXME - The subproxy might not yet be set, so just return as if everything
+    // is okay.
+    return true;
+    }
+
+  for (unsigned int i = 0; i < element->GetNumberOfNestedElements(); i++)
+    {
+    vtkPVXMLElement* exposedElement = element->GetNestedElement(i);
+    if (!(strcmp(exposedElement->GetName(), "ExposedProperties") == 0 ||
+          strcmp(exposedElement->GetName(), "PropertyGroup") == 0))
+      {
+      continue;
+      }
+    for (unsigned int j = 0; j < exposedElement->GetNumberOfNestedElements(); j++)
+      {
+      vtkPVXMLElement* propertyElement = exposedElement->GetNestedElement(j);
+      if (strcmp(propertyElement->GetName(), "Property") == 0)
+        {
+        this->SetupExposedSIProperty(propertyElement, subproxy_name);
+        }
+      else if(strcmp(propertyElement->GetName(), "PropertyGroup") == 0)
+        {
+        // Process properties exposed under this element first.
+        vtkPVXMLElement *groupElement = propertyElement;
+        for (unsigned int k = 0; k < groupElement->GetNumberOfNestedElements(); k++)
+          {
+          this->SetupExposedSIProperty(groupElement->GetNestedElement(k), subproxy_name);
+          }
+     
+        }
+      else
+        {
+        vtkErrorMacro("<ExposedProperties> can contain <Property> or <PropertyGroup> elements.");
+        continue;
+        }
+      }
+    }
+
   return true;
 }
 //----------------------------------------------------------------------------
@@ -550,6 +677,133 @@ void vtkSIProxy::CleanInputs(const char* method)
          << method
          << vtkClientServerStream::End;
   this->Interpreter->ProcessStream(stream);
+}
+
+//---------------------------------------------------------------------------
+vtkSIProperty* vtkSIProxy::SetupExposedSIProperty(vtkPVXMLElement* propertyElement,
+                                                  const char* subproxy_name)
+{
+  const char* name = propertyElement->GetAttribute("name");
+  if (!name || !name[0])
+    {
+    vtkErrorMacro("Attribute name is required!");
+    return 0;
+    }
+  const char* exposed_name = propertyElement->GetAttribute("exposed_name");
+  if (!exposed_name)
+    {
+    // use the property name as the exposed name.
+    exposed_name = name;
+    }
+  int override = 0;
+  if (!propertyElement->GetScalarAttribute("override", &override))
+    {
+    override = 0;
+    }
+
+  if (propertyElement->GetAttribute("default_values"))
+    {
+    vtkSIProxy *subproxy = this->GetSubSIProxy(subproxy_name);
+    vtkSIProperty* prop = subproxy->GetSIProperty(name);
+    if (!prop)
+      {
+      vtkWarningMacro("Failed to locate property '" << name
+                      << "' on subproxy '" << subproxy_name << "'");
+      return 0;
+      }
+    subproxy = subproxy->GetTrueSIProxy(name);
+    if (!prop->ReadXMLAttributes(subproxy, propertyElement))
+      {
+      return 0;
+      }
+    }
+  this->ExposeSubSIProxyProperty(subproxy_name, name, exposed_name, override);
+
+  vtkSIProxy* subproxy = this->GetSubSIProxy(subproxy_name);
+  vtkSIProperty *prop = subproxy->GetSIProperty(name);
+
+  if (!prop)
+    {
+    vtkWarningMacro("Failed to locate property '" << name
+                    << "' on subproxy '" << subproxy_name << "': " << this->XMLName);
+    return 0;
+    }
+
+  return prop;
+}
+
+//---------------------------------------------------------------------------
+void vtkSIProxy::SetupExposedSIProperties(const char* subproxy_name,
+  vtkPVXMLElement *element)
+{
+  if (!subproxy_name || !element)
+    {
+    return;
+    }
+
+  unsigned int i,j;
+  for ( i = 0; i < element->GetNumberOfNestedElements(); i++)
+    {
+    vtkPVXMLElement* exposedElement = element->GetNestedElement(i);
+    if (!(strcmp(exposedElement->GetName(), "ExposedProperties") == 0 ||
+          strcmp(exposedElement->GetName(), "PropertyGroup") == 0))
+      {
+      continue;
+      }
+    for ( j = 0; j < exposedElement->GetNumberOfNestedElements(); j++)
+      {
+      vtkPVXMLElement* propertyElement = exposedElement->GetNestedElement(j);
+      if (strcmp(propertyElement->GetName(), "Property") == 0)
+        {
+        this->SetupExposedSIProperty(propertyElement, subproxy_name);
+        }
+      else if(strcmp(propertyElement->GetName(), "PropertyGroup") == 0)
+        {
+        // Process properties exposed under this element first.
+        vtkPVXMLElement *groupElement = propertyElement;
+        for (unsigned int k = 0; k < groupElement->GetNumberOfNestedElements(); k++)
+          {
+          this->SetupExposedSIProperty(groupElement->GetNestedElement(k), subproxy_name);
+          }
+     
+        // Now create the group.
+        //this->NewPropertyGroup(groupElement);
+        }
+      else
+        {
+        vtkErrorMacro("<ExposedProperties> can contain only <Property> or <PropertyGroup> elements.");
+        continue;
+        }
+      }
+    }
+}
+
+//----------------------------------------------------------------------------
+void vtkSIProxy::ExposeSubSIProxyProperty(const char* subproxy_name,
+  const char* property_name, const char* exposed_name,
+  int override)
+{
+  if (!subproxy_name || !property_name || !exposed_name)
+    {
+    vtkErrorMacro("Either subproxy name, property name, or exposed name is NULL.");
+    return;
+    }
+
+  vtkInternals::ExposedSIPropertyInfoMap::iterator iter =
+    this->Internals->ExposedSIProperties.find(exposed_name);
+  if (iter != this->Internals->ExposedSIProperties.end())
+    {
+    if (!override)
+      {
+      vtkWarningMacro("An exposed property with the name \"" << exposed_name
+                      << "\" already exists. It will be replaced.");
+      }
+    }
+
+  vtkInternals::ExposedSIPropertyInfo info;
+  info.SubProxyName = subproxy_name;
+  info.PropertyName = property_name;
+  this->Internals->ExposedSIProperties[exposed_name] = info;
 }
 
 //----------------------------------------------------------------------------

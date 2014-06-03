@@ -63,7 +63,18 @@ public:
 
   // Description:
   // Provides access to the property helper.
-  vtkSIProperty* GetSIProperty(const char* name);
+  vtkSIProperty* GetSIProperty(const char* name)
+  {
+    return this->GetSIProperty(name, 0 /* selfOnly */);
+  }
+
+  // Description:
+  // Provides access to the property helper.
+  vtkSIProperty* GetSIProperty(const char* name, int selfOnly);
+
+  // Description:
+  // Returns the subproxy that owns the given property.
+  vtkSIProxy* GetTrueSIProxy(const char* name);
 
   // Description:
   // Returns the VTKClassName.
@@ -141,6 +152,22 @@ protected:
   // Description:
   // Adds a vtkSMProperty's server-implementation.
   void AddSIProperty(const char* name, vtkSIProperty*);
+
+  // Description:
+  // Setup exposed properties from an XML element.
+  void SetupExposedSIProperties(const char* subproxy_name,
+    vtkPVXMLElement *element);
+
+  // Description:
+  // Setup an exposed property from an XML element.
+  vtkSIProperty* SetupExposedSIProperty(vtkPVXMLElement* propertyElement,
+    const char* subproxy_name);
+
+  // Description:
+  // Sets up a property from a subproxy to be exposed with the expose_name.
+  void ExposeSubSIProxyProperty(const char* subproxy_name,
+    const char* property_name, const char* exposed_name,
+    int override);
 
   vtkSetStringMacro(VTKClassName);
   vtkSetStringMacro(XMLGroup);
